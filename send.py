@@ -9,6 +9,7 @@ QQ 群活跃度自动发送脚本（Windows / Android 通用）
     python send.py           # 立即发送一轮（全部群）
     python send.py --test    # 测试：只给第一个群发 1 条
     python send.py --loop    # 常驻模式：每天在 LOOP_WINDOW 时间段内随机发一轮
+    python send.py --daily   # 单日模式：随机延迟 0~60 分钟后发一轮并退出（配合计划任务/cron）
 """
 import json
 import random
@@ -20,7 +21,11 @@ from pathlib import Path
 
 # ========== 配置区 ==========
 API = "http://127.0.0.1:3000"          # OneBot HTTP API 地址（NapCat / Lagrange 都监听这里）
-BASE = Path(__file__).parent
+# 打包成 exe 后，配置文件放在 exe 同目录，而不是临时解压目录
+if getattr(sys, "frozen", False):
+    BASE = Path(sys.executable).parent
+else:
+    BASE = Path(__file__).parent
 GROUPS_FILE = BASE / "groups.txt"
 MESSAGES_FILE = BASE / "messages.txt"
 MIN_MSG_PER_GROUP = 2                   # 每群最少发几条
@@ -107,6 +112,14 @@ def main():
     if "--test" in sys.argv:
         send_group_msg(groups[0], random.choice(messages))
         print("测试完成，去群里看看是否收到")
+        return
+
+    if "--daily" in sys.argv:
+        # 计划任务/cron 每天调用一次：随机延迟后发一轮就退出，避免多实例
+        delay = random.randint(0, 3600)
+        print(f"单日模式：随机延迟 {delay // 60} 分 {delay % 60} 秒后发送")
+        time.sleep(delay)
+        run_once(groups, messages)
         return
 
     if "--loop" in sys.argv:
