@@ -46,8 +46,14 @@ def load_lines(path):
 
 
 def send_group_msg(group_id, text):
+    # 群号校验：一行脏数据（空格/全角数字/杂字符）不应中断整轮发送
+    try:
+        gid = int(str(group_id).strip())
+    except (TypeError, ValueError):
+        print(f"[SKIP] 无效群号: {group_id!r}")
+        return
     payload = json.dumps({
-        "group_id": int(group_id),
+        "group_id": gid,
         "message": text,
     }).encode("utf-8")
     req = urllib.request.Request(
@@ -56,12 +62,25 @@ def send_group_msg(group_id, text):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        # 单个群发送失败（挂机端掉线/超时）不中断后续群
+        print(f"[FAIL] 群 {group_id} 发送出错: {e}")
+        return
     if result.get("retcode") == 0:
         print(f"[OK] 群 {group_id}: {text}")
     else:
         print(f"[FAIL] 群 {group_id}: {result}")
+
+
+def daily_run():
+    """单日发送：随机延迟 0~60 分钟后发一轮，供计划任务/cron 调用"""
+    delay = random.randint(0, 3600)
+    print(f"随机延迟 {delay // 60} 分 {delay % 60} 秒后发送")
+    time.sleep(delay)
+    run_once(load_lines(GROUPS_FILE), load_lines(MESSAGES_FILE))
 
 
 def run_once(groups, messages):
@@ -116,10 +135,7 @@ def main():
 
     if "--daily" in sys.argv:
         # 计划任务/cron 每天调用一次：随机延迟后发一轮就退出，避免多实例
-        delay = random.randint(0, 3600)
-        print(f"单日模式：随机延迟 {delay // 60} 分 {delay % 60} 秒后发送")
-        time.sleep(delay)
-        run_once(groups, messages)
+        daily_run()
         return
 
     if "--loop" in sys.argv:

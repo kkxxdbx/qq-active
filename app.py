@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 import webbrowser
 import zipfile
@@ -41,7 +42,8 @@ LOG_FILE = BASE / "send.log"
 QQ_URL = "https://im.qq.com/pcqq/index.shtml"
 NAPCAT_API = "https://api.github.com/repos/NapNeko/NapCatQQ/releases/latest"
 
-DEFAULT_GROUPS = "# 群号列表，每行一个\n"
+# 占位群号全部用注释，防止未配置就误发到陌生群
+DEFAULT_GROUPS = "# 群号列表，每行一个\n# 例如:\n# 123456789\n"
 DEFAULT_MESSAGES = (
     "# 文案库，每行一条，发送时随机抽取\n"
     "早上好呀，都起了吗\n大家中午吃的啥\n下午好，摸鱼时间到\n今天天气不错啊\n"
@@ -52,11 +54,27 @@ DEFAULT_MESSAGES = (
 )
 
 
+# Windows 上抑制 schtasks 等子进程弹出黑色控制台窗口
+NO_WINDOW = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+
+
 def ensure_default_files():
-    if not send.GROUPS_FILE.exists():
-        send.GROUPS_FILE.write_text(DEFAULT_GROUPS, encoding="utf-8")
-    if not send.MESSAGES_FILE.exists():
-        send.MESSAGES_FILE.write_text(DEFAULT_MESSAGES, encoding="utf-8")
+    """目录无写权限时（如放在 C:\\Program Files）返回 False，不直接崩溃"""
+    try:
+        if not send.GROUPS_FILE.exists():
+            send.GROUPS_FILE.write_text(DEFAULT_GROUPS, encoding="utf-8")
+        if not send.MESSAGES_FILE.exists():
+            send.MESSAGES_FILE.write_text(DEFAULT_MESSAGES, encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
+def read_or_empty(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
 
 
 # ---------- 检测与安装动作（在线程里跑，log 为回调） ----------
@@ -79,11 +97,14 @@ def qq_installed():
 
 
 def find_boot_bat():
+    if not NAPCAT_DIR.exists():
+        return None
     for name in ("NapCatWinBootMain.bat", "BootMain.bat", "Launcher.bat", "launcher.bat"):
         p = NAPCAT_DIR / name
         if p.exists():
             return p
-    bats = sorted(NAPCAT_DIR.glob("*.bat"))
+    # 部分版本 zip 带顶层文件夹，bat 可能在子目录里，递归查找
+    bats = sorted(NAPCAT_DIR.rglob("*.bat"))
     return bats[0] if bats else None
 
 
@@ -106,13 +127,32 @@ def act_napcat(log):
         return False
     log(f"下载 {asset['name']} ...")
     zip_path = BASE / "napcat.zip"
-    urllib.request.urlretrieve(asset["browser_download_url"], zip_path)
-    log("解压中...")
+    # urlretrieve 无超时，改成分块下载并显式超时，防止网络卡住导致线程永久挂起
+    dreq = urllib.request.Request(asset["browser_download_url"],
+                                  headers={"User-Agent": "qq-active-installer"})
+    with urllib.request.urlopen(dreq, timeout=60) as resp, open(zip_path, "wb") as f:
+        while True:
+            chunk = resp.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+    log(f"下载完成（{zip_path.stat().st_size // 1024} KB），解压中...")
     with zipfile.ZipFile(zip_path) as z:
         z.extractall(NAPCAT_DIR)
     zip_path.unlink()
     log(f"NapCat 已安装到 {NAPCAT_DIR}")
     return True
+
+
+def webui_up():
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:6099/webui", timeout=2) as r:
+            return True
+    except urllib.error.URLError as e:
+        # 有响应（即使是 401/404）也说明 WebUI 端口已经起来了
+        return getattr(e, "code", None) is not None
+    except Exception:
+        return False
 
 
 def act_login(log):
@@ -124,6 +164,13 @@ def act_login(log):
     subprocess.Popen(["cmd", "/c", str(bat)], cwd=str(NAPCAT_DIR))
     log("1) 在弹出的 NapCat 窗口中完成 QQ 登录（小号）")
     log("2) 稍后自动打开 WebUI → 网络配置 → 新建 HTTP 服务器，端口 3000")
+    # 等 WebUI 端口真正起来了再打开浏览器，避免用户看到"无法访问此页面"
+    for _ in range(20):  # 最长等 60 秒
+        time.sleep(3)
+        if webui_up():
+            break
+    else:
+        log("WebUI 尚未就绪，如浏览器打不开请稍后手动刷新")
     webbrowser.open("http://127.0.0.1:6099/webui")
     for i in range(100):  # 最长等 5 分钟
         time.sleep(3)
@@ -139,7 +186,7 @@ def act_login(log):
 def task_exists():
     try:
         r = subprocess.run(["schtasks", "/Query", "/TN", TASK_NAME],
-                           capture_output=True, timeout=15)
+                           capture_output=True, timeout=15, **NO_WINDOW)
         return r.returncode == 0
     except Exception:
         return False
@@ -153,7 +200,7 @@ def act_task(log):
     r = subprocess.run(
         ["schtasks", "/Create", "/F", "/TN", TASK_NAME,
          "/TR", target, "/SC", "DAILY", "/ST", "09:30"],
-        capture_output=True, text=True, timeout=15)
+        capture_output=True, text=True, timeout=15, **NO_WINDOW)
     out = (r.stdout or "") + (r.stderr or "")
     if out.strip():
         log(out.strip())
@@ -208,9 +255,13 @@ class App:
         root.geometry("860x560")
         self.q = queue.Queue()
         self.sending = False
+        self.installing = False
         self.sel = 0
         self.status = {c["key"]: None for c in COMPONENTS}  # None=未检测
-        ensure_default_files()
+        if not ensure_default_files():
+            root.after(300, lambda: messagebox.showerror(
+                "无法写入配置文件",
+                "程序所在目录没有写权限。\n请把本程序移动到桌面、文档等有写权限的目录后再运行。"))
 
         self.installer_frame = ttk.Frame(root, padding=10)
         self.main_frame = ttk.Frame(root, padding=10)
@@ -246,12 +297,14 @@ class App:
         self.btn_all.pack(side="left")
         self.btn_next = ttk.Button(right, text="全部完成，进入主界面 →", command=self.show_main, state="disabled")
         self.btn_next.pack(anchor="w", pady=(6, 8))
-        self.log_text = tk.Text(right, height=14, state="disabled", wrap="none")
-        self.log_text.pack(fill="both", expand=True)
+        self.installer_log = tk.Text(right, height=14, state="disabled", wrap="none")
+        self.installer_log.pack(fill="both", expand=True)
+        self.log_text = self.installer_log
 
     def show_installer(self):
         self.main_frame.pack_forget()
         self.installer_frame.pack(fill="both", expand=True)
+        self.log_text = self.installer_log  # 恢复：日志写回安装页
         self._refresh()
 
     def _on_select(self):
@@ -293,11 +346,13 @@ class App:
     def _do_act(self):
         c = COMPONENTS[self.sel]
         if c["key"] == "config":
-            self._open_editor()
-            self.status["config"] = bool(c["check"]())
-            self._refresh()
+            self._open_editor(on_close=self._config_saved)
             return
         self._run_act(c)
+
+    def _config_saved(self):
+        self.status["config"] = bool(COMPONENTS[3]["check"]())
+        self._refresh()
 
     def _run_act(self, c):
         self.btn_act.config(state="disabled")
@@ -315,9 +370,14 @@ class App:
                                         self.btn_all.config(state="normal")))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _do_all(self):
-        def worker():
-            for c in COMPONENTS:
+    def _do_all(self, start=0):
+        if self.installing:
+            return
+        self.installing = True
+
+        def worker(idx):
+            for i in range(idx, len(COMPONENTS)):
+                c = COMPONENTS[i]
                 self.log(f"===== {c['name']} =====")
                 if c["check"]():
                     self.status[c["key"]] = True
@@ -325,8 +385,10 @@ class App:
                     self.log("已就绪，跳过")
                     continue
                 if c["key"] == "config":
-                    self.root.after(0, self._open_editor_blocking_next)
-                    return  # 编辑器需要主线程交互，装完前几项后再继续
+                    # 编辑器需要主线程交互：打开编辑器，保存后自动续装剩余项
+                    self.root.after(0, lambda i=i: self._open_editor(
+                        on_close=lambda: self._config_saved_then_resume(i + 1)))
+                    return
                 try:
                     ok = c["act"](self.log)
                 except Exception as e:
@@ -336,36 +398,43 @@ class App:
                 self.root.after(0, self._refresh)
                 if not ok and c["key"] == "qq":
                     self.log("请先安装 QQ，再点【一键全部安装】继续")
+                    self.installing = False
                     return
+            self.installing = False
             self.log("===== 全部完成，可进入主界面 =====")
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, args=(start,), daemon=True).start()
 
-    def _open_editor_blocking_next(self):
-        self._open_editor()
+    def _config_saved_then_resume(self, next_idx):
         self.status["config"] = bool(COMPONENTS[3]["check"]())
         self._refresh()
-        self.log("配置已保存。若其他项均 ✅，可进入主界面；否则继续【一键全部安装】")
-        self.btn_act.config(state="normal")
-        self.btn_all.config(state="normal")
+        self.log("配置已保存，继续剩余安装项...")
+        self.installing = False
+        self._do_all(start=next_idx)
 
-    def _open_editor(self):
+    def _open_editor(self, on_close=None):
         win = tk.Toplevel(self.root)
         win.title("群号与文案配置")
         win.geometry("640x520")
         ttk.Label(win, text="群号（每行一个）").pack(anchor="w", padx=10, pady=(10, 0))
         g = tk.Text(win, height=10)
         g.pack(fill="both", expand=True, padx=10)
-        g.insert("1.0", send.GROUPS_FILE.read_text(encoding="utf-8"))
+        g.insert("1.0", read_or_empty(send.GROUPS_FILE))
         ttk.Label(win, text="文案库（每行一条，随机抽取）").pack(anchor="w", padx=10, pady=(8, 0))
         m = tk.Text(win, height=12)
         m.pack(fill="both", expand=True, padx=10)
-        m.insert("1.0", send.MESSAGES_FILE.read_text(encoding="utf-8"))
+        m.insert("1.0", read_or_empty(send.MESSAGES_FILE))
 
         def save():
-            send.GROUPS_FILE.write_text(g.get("1.0", "end"), encoding="utf-8")
-            send.MESSAGES_FILE.write_text(m.get("1.0", "end"), encoding="utf-8")
+            try:
+                send.GROUPS_FILE.write_text(g.get("1.0", "end"), encoding="utf-8")
+                send.MESSAGES_FILE.write_text(m.get("1.0", "end"), encoding="utf-8")
+            except OSError as e:
+                messagebox.showerror("保存失败", f"无法写入文件：{e}\n请把程序放到有写权限的目录。", parent=win)
+                return
             messagebox.showinfo("保存", "已保存", parent=win)
             win.destroy()
+            if on_close:
+                on_close()
         ttk.Button(win, text="保存", command=save).pack(pady=8)
         win.grab_set()
 
@@ -430,16 +499,15 @@ def run_daily_console():
                 lf.flush()
         sys.stdout = sys.stderr = Tee()
         print(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} 计划任务触发 =====")
-        ensure_default_files()
+        if not ensure_default_files():
+            print("配置文件不可写（目录无权限），跳过本次发送")
+            return
         groups = send.load_lines(send.GROUPS_FILE)
         messages = send.load_lines(send.MESSAGES_FILE)
         if not groups or not messages:
             print("配置为空，跳过本次发送")
             return
-        delay = random.randint(0, 3600)
-        print(f"随机延迟 {delay // 60} 分 {delay % 60} 秒后发送")
-        time.sleep(delay)
-        send.run_once(groups, messages)
+        send.daily_run()
 
 
 def main():

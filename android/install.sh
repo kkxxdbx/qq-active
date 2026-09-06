@@ -27,9 +27,19 @@ if [ ! -x ./Lagrange.OneBot ]; then
     echo "未找到下载地址，请到 LagrangeDev/Lagrange.OneBot 的 Releases 手动下载 linux-arm64 版"
     exit 1
   fi
-  wget -q -O lagrange.zip "$URL"
-  unzip -o -q lagrange.zip
-  rm -f lagrange.zip
+  wget -q -O lagrange.pkg "$URL"
+  # 按实际格式解压：新版本可能是 zip 也可能是 tar.gz
+  case "$URL" in
+    *.zip)            unzip -o -q lagrange.pkg ;;
+    *.tar.gz|*.tgz)   tar xzf lagrange.pkg ;;
+    *)                unzip -o -q lagrange.pkg 2>/dev/null || tar xzf lagrange.pkg ;;
+  esac
+  rm -f lagrange.pkg
+  # 压缩包若带顶层文件夹，把可执行文件挪到当前目录
+  if [ ! -f ./Lagrange.OneBot ]; then
+    FOUND=$(find . -maxdepth 3 -type f -name "Lagrange.OneBot*" 2>/dev/null | head -1)
+    [ -n "$FOUND" ] && mv "$FOUND" ./Lagrange.OneBot
+  fi
   chmod +x Lagrange.OneBot
 fi
 

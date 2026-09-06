@@ -12,11 +12,20 @@ if [ ! -x ./Lagrange.OneBot ]; then
     exit 1
 fi
 
-if ! pgrep -f Lagrange.OneBot >/dev/null; then
+# 进程检测：pgrep 优先，缺失时回退到 ps+grep，避免检测失败导致重复启动
+lagrange_running() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -f "Lagrange.OneBot" >/dev/null 2>&1
+    else
+        ps -A 2>/dev/null | grep -q "[L]agrange.OneBot"
+    fi
+}
+
+if ! lagrange_running; then
     nohup ./Lagrange.OneBot > lagrange.log 2>&1 &
     echo "Lagrange 已后台启动（日志: lagrange.log）"
 else
-    echo "Lagrange 已在运行"
+    echo "Lagrange 已在运行，跳过启动"
 fi
 
 echo "启动每日发送循环..."
