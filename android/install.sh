@@ -27,17 +27,30 @@ else
   URL=$(curl -fsSL "https://api.github.com/repos/LagrangeDev/Lagrange.Core/releases/tags/nightly" 2>/dev/null \
         | grep -o '"browser_download_url": *"[^"]*linux-arm64[^"]*\.tar\.gz"' | head -1 | cut -d'"' -f4)
   if [ -z "$URL" ]; then
-    # API 限流/失败时用固定直链兜底
     URL="https://github.com/LagrangeDev/Lagrange.Core/releases/download/nightly/Lagrange.OneBot_linux-arm64_net9.0_SelfContained.tar.gz"
-    echo "GitHub API 不可用，改用固定直链"
   fi
-  echo "下载: $URL"
-  wget -q -O lagrange.pkg "$URL" || { echo "下载失败，请手动下载后放到 $DIR 并 chmod +x"; exit 1; }
-  case "$URL" in
-    *.zip)          unzip -o -q lagrange.pkg ;;
-    *.tar.gz|*.tgz) tar xzf lagrange.pkg ;;
-    *)              tar xzf lagrange.pkg 2>/dev/null || unzip -o -q lagrange.pkg ;;
-  esac
+  # 多下载源轮询：直连慢/断时自动换镜像；显示进度条，单源 45 秒无响应即换
+  SOURCES="$URL
+https://ghfast.top/$URL
+https://gh-proxy.com/$URL
+https://mirror.ghproxy.com/$URL"
+  ok=""
+  for U in $SOURCES; do
+    echo "下载源: $U"
+    if wget --timeout=45 --tries=1 --progress=dot:giga -O lagrange.pkg "$U" \
+       && tar tzf lagrange.pkg >/dev/null 2>&1; then
+      ok=1
+      break
+    fi
+    echo "该源失败，切换下一个..."
+    rm -f lagrange.pkg
+  done
+  if [ -z "$ok" ]; then
+    echo "所有下载源均失败，请手动下载后放到 $DIR 并 chmod +x:"
+    echo "  $URL"
+    exit 1
+  fi
+  tar xzf lagrange.pkg
   rm -f lagrange.pkg
   # 发布包内是深层嵌套路径（.../publish/Lagrange.OneBot），把主程序挪到根目录
   FOUND=$(find . -type f -name "Lagrange.OneBot" 2>/dev/null | head -1)
