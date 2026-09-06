@@ -1,0 +1,6 @@
+__pycache__/
+send.log
+lagrange.log
+boot-run.log
+napcat/
+config.json
