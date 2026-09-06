@@ -20,32 +20,42 @@ fi
 cd "$DIR"
 
 echo "==> [3/5] 下载 Lagrange.OneBot (linux-arm64)..."
-if [ ! -x ./Lagrange.OneBot ]; then
-  URL=$(curl -fsSL https://api.github.com/repos/LagrangeDev/Lagrange.OneBot/releases/latest \
-        | grep -o '"browser_download_url": *"[^"]*linux-arm64[^"]*"' | head -1 | cut -d'"' -f4)
+if [ -x ./Lagrange.OneBot ]; then
+  echo "已安装，跳过（重装请删除 Lagrange.OneBot 后重跑）"
+else
+  # OneBot 仓库已合并：发布物现在挂在 Lagrange.Core 的 nightly 下
+  URL=$(curl -fsSL "https://api.github.com/repos/LagrangeDev/Lagrange.Core/releases/tags/nightly" 2>/dev/null \
+        | grep -o '"browser_download_url": *"[^"]*linux-arm64[^"]*\.tar\.gz"' | head -1 | cut -d'"' -f4)
   if [ -z "$URL" ]; then
-    echo "未找到下载地址，请到 LagrangeDev/Lagrange.OneBot 的 Releases 手动下载 linux-arm64 版"
-    exit 1
+    # API 限流/失败时用固定直链兜底
+    URL="https://github.com/LagrangeDev/Lagrange.Core/releases/download/nightly/Lagrange.OneBot_linux-arm64_net9.0_SelfContained.tar.gz"
+    echo "GitHub API 不可用，改用固定直链"
   fi
-  wget -q -O lagrange.pkg "$URL"
-  # 按实际格式解压：新版本可能是 zip 也可能是 tar.gz
+  echo "下载: $URL"
+  wget -q -O lagrange.pkg "$URL" || { echo "下载失败，请手动下载后放到 $DIR 并 chmod +x"; exit 1; }
   case "$URL" in
-    *.zip)            unzip -o -q lagrange.pkg ;;
-    *.tar.gz|*.tgz)   tar xzf lagrange.pkg ;;
-    *)                unzip -o -q lagrange.pkg 2>/dev/null || tar xzf lagrange.pkg ;;
+    *.zip)          unzip -o -q lagrange.pkg ;;
+    *.tar.gz|*.tgz) tar xzf lagrange.pkg ;;
+    *)              tar xzf lagrange.pkg 2>/dev/null || unzip -o -q lagrange.pkg ;;
   esac
   rm -f lagrange.pkg
-  # 压缩包若带顶层文件夹，把可执行文件挪到当前目录
-  if [ ! -f ./Lagrange.OneBot ]; then
-    FOUND=$(find . -maxdepth 3 -type f -name "Lagrange.OneBot*" 2>/dev/null | head -1)
-    [ -n "$FOUND" ] && mv "$FOUND" ./Lagrange.OneBot
+  # 发布包内是深层嵌套路径（.../publish/Lagrange.OneBot），把主程序挪到根目录
+  FOUND=$(find . -type f -name "Lagrange.OneBot" 2>/dev/null | head -1)
+  if [ -z "$FOUND" ]; then
+    echo "解压后未找到主程序 Lagrange.OneBot"
+    exit 1
   fi
-  chmod +x Lagrange.OneBot
+  if [ "$FOUND" != "./Lagrange.OneBot" ]; then
+    mv "$FOUND" ./Lagrange.OneBot.tmp
+    rm -rf ./Lagrange.OneBot        # 解压出的目录树与目标文件名冲突，先删
+    mv ./Lagrange.OneBot.tmp ./Lagrange.OneBot
+  fi
+  chmod +x ./Lagrange.OneBot
 fi
 
 echo "==> [4/5] 配置 HTTP 接口 (127.0.0.1:3000)..."
 # 首次运行让 Lagrange 生成默认配置
-[ -f appsettings.json ] || [ -f config.json ] || timeout 8 ./Lagrange.OneBot >/dev/null 2>&1 || true
+[ -f appsettings.json ] || [ -f config.json ] || timeout 15 ./Lagrange.OneBot >/dev/null 2>&1 || true
 python - <<'EOF'
 import json, os
 for name in ("appsettings.json", "config.json"):
@@ -53,19 +63,28 @@ for name in ("appsettings.json", "config.json"):
         continue
     with open(name, encoding="utf-8") as f:
         cfg = json.load(f)
-    imps = cfg.setdefault("implementations", [])
+    # 新版配置键为大写 Implementations，兼容旧小写
+    key = "Implementations" if "Implementations" in cfg else "implementations"
+    imps = cfg.get(key) or []
+    replaced = False
     for imp in imps:
-        if imp.get("type") in ("forward_http", "http", "HttpPost"):
-            imp.update({"type": "forward_http", "host": "127.0.0.1", "port": 3000})
+        t = imp.get("Type") or imp.get("type") or ""
+        if t.lower() in ("forwardhttp", "forward_http", "http"):
+            imp.clear()
+            imp.update({"Type": "ForwardHttp", "Host": "127.0.0.1", "Port": 3000,
+                        "HeartBeatEnable": False, "HeartBeatInterval": 5000, "AccessToken": ""})
+            replaced = True
             break
-    else:
-        imps.append({"type": "forward_http", "host": "127.0.0.1", "port": 3000})
+    if not replaced:
+        imps.append({"Type": "ForwardHttp", "Host": "127.0.0.1", "Port": 3000,
+                     "HeartBeatEnable": False, "HeartBeatInterval": 5000, "AccessToken": ""})
+    cfg[key] = imps
     with open(name, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-    print(f"已配置 {name}: HTTP 127.0.0.1:3000")
+        json.dump(cfg, f, indent=4, ensure_ascii=False)
+    print(f"已配置 {name}: ForwardHttp 127.0.0.1:3000")
     break
 else:
-    print("未找到配置文件，请按 README 手动配置 HTTP 3000")
+    print("未找到配置文件，请按 README 手动配置 ForwardHttp 127.0.0.1:3000")
 EOF
 
 echo "==> [5/5] 保活与开机自启..."
